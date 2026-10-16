@@ -144,6 +144,13 @@ impl SystemTrayManager {
         let identity = session_identity(icon_data)?;
         let window_path = window_program_path(icon_data);
 
+        if self.legacy_tray {
+            // NIM_ADD already supplies the live identity and callback on Windows 10.
+            // Do not wait for registry records that this version of Explorer never writes.
+            let entry = legacy_icon_entry(icon_data, window_path.clone())?;
+            return self.store_new_icon(icon_data, entry, window_path);
+        }
+
         let Some(entry) =
             find_registry_notify_icon(window_path.as_deref(), icon_data.guid, icon_data.uid)
         else {
@@ -161,6 +168,12 @@ impl SystemTrayManager {
     fn process_nim_update(&self, icon_data: &IconEventData) -> Option<SystrayEvent> {
         if let Some(stored) = self.find_stored_icon(icon_data) {
             return self.update_stored_icon(stored, icon_data);
+        }
+
+        // An unknown NIM_MODIFY is not proof that Explorer accepted an icon.
+        // Wait for NIM_ADD instead of creating phantom icons on Windows 10.
+        if self.legacy_tray {
+            return None;
         }
 
         let identity = session_identity(icon_data)?;
@@ -626,4 +639,19 @@ fn merge_icon_data(held: &mut IconEventData, newer: &IconEventData) {
     held.version = newer.version.or(held.version);
     held.is_visible = newer.is_visible.or(held.is_visible);
     held.shared_icon = newer.shared_icon.or(held.shared_icon);
+}
+
+/// Session metadata for Windows 10, where NotifyIconSettings does not exist.
+/// A live window and UID are required for the existing click/delete dispatch.
+fn legacy_icon_entry(data: &IconEventData, path: Option<PathBuf>) -> Option<RegistryNotifyIcon> {
+    data.window_handle.filter(|handle| *handle != 0)?;
+    data.uid?;
+    Some(RegistryNotifyIcon {
+        key: format!("session-{}", session_identity(data)?),
+        executable_path: path.unwrap_or_default(),
+        initial_tooltip: data.tooltip.clone(),
+        icon_guid: data.guid,
+        icon_uid: data.uid,
+        is_promoted: false,
+    })
 }

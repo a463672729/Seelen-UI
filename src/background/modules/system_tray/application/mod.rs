@@ -7,6 +7,7 @@ use std::{
     sync::{LazyLock, Once},
 };
 
+use parking_lot::Mutex;
 use seelen_core::system_state::SysTrayIcon;
 use slu_ipc::messages::{IconEventData, Win32TrayEvent};
 use winreg::{
@@ -19,12 +20,16 @@ use crate::{
     event_manager,
     hook::HookManager,
     modules::system_tray::application::tray_hook_loader::TrayHookLoader,
-    utils::{lock_free::SyncHashMap, resolve_guid_path},
+    utils::{is_windows_10, lock_free::SyncHashMap, resolve_guid_path},
     windows_api::window::event::WinEvent,
 };
 
 pub struct SystemTrayManager {
-    /// Icons by their registry key.
+    /// Windows 10 has no per-icon NotifyIconSettings registry entries.
+    legacy_tray: bool,
+    /// Session-only order for Windows 10; never written to Windows 11 registry data.
+    legacy_order: Mutex<Vec<String>>,
+    /// Icons by their registry key (or session identity on Windows 10).
     icons: SyncHashMap<String, SysTrayIcon>,
     /// Process that owned each icon's window when it was registered, used to
     /// detect a recycled window handle.
@@ -55,6 +60,8 @@ impl SystemTrayManager {
         };
 
         Self {
+            legacy_tray: is_windows_10(),
+            legacy_order: Mutex::new(Vec::new()),
             icons: SyncHashMap::new(),
             owners: SyncHashMap::new(),
             pending: SyncHashMap::new(),
@@ -111,10 +118,24 @@ impl SystemTrayManager {
     /// (`UIOrderList`). Icons missing from that list are placed at the end.
     pub fn icons(&self) -> Vec<SysTrayIcon> {
         let mut icons = self.icons.values();
-        let order = get_registry_ui_order().unwrap_or_else(|err| {
-            log::warn!("Failed to read tray icons UI order: {err:?}");
-            Vec::new()
-        });
+        let order = if self.legacy_tray {
+            let mut order = self.legacy_order.lock();
+            order.retain(|key| icons.iter().any(|icon| &icon.registry_key == key));
+            // Hash map iteration order is unstable; append new identities deterministically.
+            let mut added: Vec<String> = icons
+                .iter()
+                .map(|icon| icon.registry_key.clone())
+                .filter(|key| !order.contains(key))
+                .collect();
+            added.sort();
+            order.extend(added);
+            order.clone()
+        } else {
+            get_registry_ui_order().unwrap_or_else(|err| {
+                log::warn!("Failed to read tray icons UI order: {err:?}");
+                Vec::new()
+            })
+        };
         icons.sort_by_key(|icon| {
             order
                 .iter()
@@ -127,9 +148,15 @@ impl SystemTrayManager {
     /// Reorders the icons on the registry UI order following `keys`, entries not included
     /// in `keys` (like icons of closed apps) keep their position.
     pub fn set_order(&self, keys: &[String]) -> Result<()> {
-        let mut order = get_registry_ui_order()?;
-        sort_ui_order(&mut order, keys);
-        set_registry_ui_order(&order)?;
+        if self.legacy_tray {
+            // Populate the session order before taking its lock.
+            self.icons();
+            sort_ui_order(&mut self.legacy_order.lock(), keys);
+        } else {
+            let mut order = get_registry_ui_order()?;
+            sort_ui_order(&mut order, keys);
+            set_registry_ui_order(&order)?;
+        }
         Self::send(SystemTrayEvent::Changed);
         Ok(())
     }
@@ -139,7 +166,9 @@ impl SystemTrayManager {
         if !self.icons.contains_key(registry_key) {
             return Err("Icon not found".into());
         }
-        set_registry_notify_icon_promoted(registry_key, promoted)?;
+        if !self.legacy_tray {
+            set_registry_notify_icon_promoted(registry_key, promoted)?;
+        }
         self.icons.with_lock(|icons| {
             if let Some(icon) = icons.get_mut(registry_key) {
                 icon.is_promoted = promoted;
